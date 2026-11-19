@@ -55,7 +55,39 @@ def plan_mips(textures, budget_bytes):
         ``{"resident": {id: level}, "bytes": 总驻留字节数}``；
         ``bytes`` 一定满足 ``0 <= bytes <= budget_bytes``。
     """
-    raise NotImplementedError("plan_mips 尚未实现")
+    if budget_bytes < 0:
+        raise StreamError("budget_bytes 必须是非负整数")
+
+    # 同一 id 去重，只保留第一次出现的纹理记录。
+    unique = {}
+    for texture in textures:
+        tid = texture["id"]
+        if tid not in unique:
+            unique[tid] = texture
+
+    # 优先级降序、id 升序：按重要性而不是请求顺序分配预算。
+    ordered = sorted(
+        unique.values(),
+        key=lambda texture: (-texture["priority"], texture["id"]),
+    )
+
+    resident = {}
+    used_bytes = 0
+    for texture in ordered:
+        mips = texture["mips"]
+        chosen_level = None
+        for level, size in enumerate(mips):
+            # 按字节核算：第一个放得下的级别就是最精细的可用级别。
+            if used_bytes + size <= budget_bytes:
+                chosen_level = level
+                break
+        if chosen_level is None:
+            # 连最粗糙的一级都放不下，该纹理不驻留。
+            continue
+        resident[texture["id"]] = chosen_level
+        used_bytes += mips[chosen_level]
+
+    return {"resident": resident, "bytes": used_bytes}
 
 
 def priority_score(texture, screen_coverage, distance):
@@ -78,7 +110,11 @@ def priority_score(texture, screen_coverage, distance):
     返回值恒在 0.0..1.0 内，不会越界。浮点比较使用 1e-6 容差
     （测试中对应 ``pytest.approx`` 的默认容差）。
     """
-    raise NotImplementedError("priority_score 尚未实现")
+    coverage = min(max(screen_coverage, 0.0), 1.0)
+    dist = max(float(distance), 0.0)
+    priority = min(max(texture["priority"], 0.0), 1.0)
+    score = priority * coverage / (1.0 + dist)
+    return min(max(score, 0.0), 1.0)
 
 
 def evict_lru(resident, need_bytes, tick):
@@ -104,7 +140,27 @@ def evict_lru(resident, need_bytes, tick):
         ``{"evicted": [id, ...], "freed": int}``，``evicted`` 按实际
         淘汰顺序排列，``freed`` 是被淘汰条目的字节数之和。
     """
-    raise NotImplementedError("evict_lru 尚未实现")
+    if need_bytes <= 0:
+        return {"evicted": [], "freed": 0}
+
+    # 保护正在使用的纹理，其余才是淘汰候选。
+    candidates = [
+        (tid, info)
+        for tid, info in resident.items()
+        if not info["in_use"] and info["last_used"] < tick
+    ]
+    # LRU：最久未使用优先；同 tick 时按 id 升序保证确定性。
+    candidates.sort(key=lambda item: (item[1]["last_used"], item[0]))
+
+    evicted = []
+    freed = 0
+    for tid, info in candidates:
+        if freed >= need_bytes:
+            break
+        evicted.append(tid)
+        freed += info["bytes"]
+
+    return {"evicted": evicted, "freed": freed}
 
 
 def promote(texture, level, budget):
@@ -125,7 +181,18 @@ def promote(texture, level, budget):
           ``{"ok": True, "bytes": mips[level],
           "new_used": used + mips[level]}``。
     """
-    raise NotImplementedError("promote 尚未实现")
+    mips = texture["mips"]
+    if not isinstance(level, int) or level < 0 or level >= len(mips):
+        raise StreamError("非法 mip 级别: %r" % (level,))
+
+    used = budget["used"]
+    limit = budget["limit"]
+    size = mips[level]
+
+    # 先校验预算再装载，杜绝瞬间超限。
+    if used + size <= limit:
+        return {"ok": True, "bytes": size, "new_used": used + size}
+    return {"ok": False}
 
 
 def fallback_level(texture, missing_mips):
@@ -144,7 +211,16 @@ def fallback_level(texture, missing_mips):
           绝不返回缺失级别，也绝不无条件回退到 0 级。
         - ``mips`` 为空时抛 :class:`StreamError`。
     """
-    raise NotImplementedError("fallback_level 尚未实现")
+    mips = texture["mips"]
+    if not mips:
+        raise StreamError("纹理没有任何 mip 级别")
+
+    missing = set(missing_mips)
+    for level in range(len(mips)):
+        if level not in missing:
+            return level
+    # 全部缺失时回退到最粗糙的一层，而不是无条件回到 0 级。
+    return len(mips) - 1
 
 
 def align_bytes(size, alignment):
@@ -160,7 +236,14 @@ def align_bytes(size, alignment):
         - 非法 ``alignment`` 或负数 ``size`` 抛 :class:`StreamError`。
         - 幂等：``align_bytes(align_bytes(x, a), a) == align_bytes(x, a)``。
     """
-    raise NotImplementedError("align_bytes 尚未实现")
+    if size < 0:
+        raise StreamError("size 必须是非负整数")
+    if alignment not in (4, 16, 64):
+        raise StreamError("alignment 只允许 4、16、64，收到 %r" % (alignment,))
+    if size == 0:
+        return 0
+    # 向上取整：((size + a - 1) // a) * a，保证 DDS 行宽不错位。
+    return ((size + alignment - 1) // alignment) * alignment
 
 
 def resolve_mip(size, level):
@@ -175,7 +258,11 @@ def resolve_mip(size, level):
           且不设下限时可能出现的 0 必须夹到 1。
         - ``size`` 非正或 ``level`` 为负时抛 :class:`StreamError`。
     """
-    raise NotImplementedError("resolve_mip 尚未实现")
+    if size <= 0:
+        raise StreamError("size 必须是正整数")
+    if level < 0:
+        raise StreamError("level 必须是非负整数")
+    return max(1, size // (2 ** level))
 
 
 def stream_batch(requests, budget):
@@ -202,4 +289,56 @@ def stream_batch(requests, budget):
           "bytes": 总驻留字节数, "skipped": [id, ...]}``；
           ``bytes`` 一定不超过 ``budget``。
     """
-    raise NotImplementedError("stream_batch 尚未实现")
+    if budget < 0:
+        raise StreamError("budget 必须是非负整数")
+
+    rollback = {"ok": False, "resident": {}, "bytes": 0, "skipped": []}
+
+    # 第一阶段：校验全部请求。任何一条损坏都整体回滚，不装载任何纹理。
+    for request in requests:
+        texture = request["texture"]
+        mips = texture.get("mips", [])
+        level = request["level"]
+        if (
+            not mips
+            or any(size <= 0 for size in mips)
+            or not isinstance(level, int)
+            or level < 0
+            or level >= len(mips)
+        ):
+            return rollback
+
+    # 第二阶段：按 id 去重，同一纹理只保留最精细（最小）的级别。
+    deduped = {}
+    for request in requests:
+        texture = request["texture"]
+        tid = texture["id"]
+        level = request["level"]
+        if tid not in deduped or level < deduped[tid][1]:
+            deduped[tid] = (texture, level)
+
+    # 按优先级降序、id 升序装载，与输入请求顺序无关。
+    ordered = sorted(
+        deduped.values(),
+        key=lambda item: (-item[0]["priority"], item[0]["id"]),
+    )
+
+    resident = {}
+    used_bytes = 0
+    skipped = []
+    for texture, level in ordered:
+        tid = texture["id"]
+        size = texture["mips"][level]
+        # 按字节核算预算：放不下则跳过该纹理，继续处理后续请求。
+        if used_bytes + size <= budget:
+            resident[tid] = level
+            used_bytes += size
+        else:
+            skipped.append(tid)
+
+    return {
+        "ok": True,
+        "resident": resident,
+        "bytes": used_bytes,
+        "skipped": skipped,
+    }
